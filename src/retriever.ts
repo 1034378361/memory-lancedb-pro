@@ -70,6 +70,10 @@ export interface RetrievalConfig {
   /** Maximum half-life multiplier from access reinforcement.
    *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
   maxHalfLifeMultiplier: number;
+  /** Tag prefixes for exact-match queries (default: ["proj", "env", "team", "scope"]).
+   *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
+   *  to avoid semantic false positives from vector search. */
+  tagPrefixes: string[];
 }
 
 export interface RetrievalContext {
@@ -111,6 +115,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  tagPrefixes: ["proj", "env", "team", "scope"],
 };
 
 // ============================================================================
@@ -280,17 +285,29 @@ function cosineSimilarity(a: number[], b: number[]): number {
 // ============================================================================
 
 export class MemoryRetriever {
-  private static TAG_QUERY_RE = /\bproj:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\b/g;
   private accessTracker: AccessTracker | null = null;
+  private tagQueryRegex: RegExp;
 
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
     private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
-  ) {}
+  ) {
+    this.tagQueryRegex = this.buildTagQueryRegex(config.tagPrefixes);
+  }
 
   setAccessTracker(tracker: AccessTracker): void {
     this.accessTracker = tracker;
+  }
+
+  private buildTagQueryRegex(prefixes: string[]): RegExp {
+    if (!prefixes || prefixes.length === 0) {
+      // Fallback: match nothing
+      return /(?!)/g;
+    }
+    const escaped = prefixes.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const pattern = `\\b(?:${escaped.join("|")}):[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\b`;
+    return new RegExp(pattern, "g");
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
@@ -345,7 +362,7 @@ export class MemoryRetriever {
   }
 
   private extractTagTokens(query: string): string[] {
-    const matches = query.match(MemoryRetriever.TAG_QUERY_RE) || [];
+    const matches = query.match(this.tagQueryRegex) || [];
     const uniq = Array.from(
       new Set(matches.map((s) => s.trim()).filter(Boolean)),
     );
@@ -381,6 +398,7 @@ export class MemoryRetriever {
         ({
           ...result,
           sources: {
+            vector: undefined,
             bm25: { score: result.score, rank: index + 1 },
             fused: { score: result.score },
           },
@@ -931,6 +949,10 @@ export class MemoryRetriever {
   // Update configuration
   updateConfig(newConfig: Partial<RetrievalConfig>): void {
     this.config = { ...this.config, ...newConfig };
+    // Rebuild tag regex if tagPrefixes changed
+    if (newConfig.tagPrefixes) {
+      this.tagQueryRegex = this.buildTagQueryRegex(this.config.tagPrefixes);
+    }
   }
 
   // Get current configuration
