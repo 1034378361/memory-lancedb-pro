@@ -47,15 +47,8 @@ export interface RetrievalConfig {
    *  - "jina" (default): Authorization: Bearer, string[] documents, results[].relevance_score
    *  - "siliconflow": same format as jina (alias, for clarity)
    *  - "voyage": Authorization: Bearer, string[] documents, data[].relevance_score
-   *  - "pinecone": Api-Key header, {text}[] documents, data[].score
-   *  - "tei": Authorization: Bearer, string[] texts, top-level [{ index, score }] */
-  rerankProvider?:
-    | "jina"
-    | "siliconflow"
-    | "voyage"
-    | "pinecone"
-    | "dashscope"
-    | "tei";
+   *  - "pinecone": Api-Key header, {text}[] documents, data[].score */
+  rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone" | "dashscope";
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -85,6 +78,10 @@ export interface RetrievalConfig {
   /** Maximum half-life multiplier from access reinforcement.
    *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
   maxHalfLifeMultiplier: number;
+  /** Tag prefixes for exact-match queries (default: ["proj", "env", "team", "scope"]).
+   *  Queries containing these prefixes (e.g. "proj:AIF") will use BM25-only + mustContain
+   *  to avoid semantic false positives from vector search. */
+  tagPrefixes: string[];
 }
 
 export interface RetrievalContext {
@@ -126,6 +123,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  tagPrefixes: ["proj", "env", "team", "scope"],
 };
 
 // ============================================================================
@@ -151,13 +149,7 @@ function clamp01WithFloor(value: number, floor: number): number {
 // Rerank Provider Adapters
 // ============================================================================
 
-type RerankProvider =
-  | "jina"
-  | "siliconflow"
-  | "voyage"
-  | "pinecone"
-  | "dashscope"
-  | "tei";
+type RerankProvider = "jina" | "siliconflow" | "voyage" | "pinecone" | "dashscope";
 
 interface RerankItem {
   index: number;
@@ -170,21 +162,10 @@ function buildRerankRequest(
   apiKey: string,
   model: string,
   query: string,
-  candidates: string[],
+  documents: string[],
   topN: number,
 ): { headers: Record<string, string>; body: Record<string, unknown> } {
   switch (provider) {
-    case "tei":
-      return {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: {
-          query,
-          texts: candidates,
-        },
-      };
     case "dashscope":
       // DashScope wraps query+documents under `input` and does not use top_n.
       // Endpoint: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
@@ -197,7 +178,7 @@ function buildRerankRequest(
           model,
           input: {
             query,
-            documents: candidates,
+            documents,
           },
         },
       };
@@ -211,7 +192,7 @@ function buildRerankRequest(
         body: {
           model,
           query,
-          documents: candidates.map((text) => ({ text })),
+          documents: documents.map((text) => ({ text })),
           top_n: topN,
           rank_fields: ["text"],
         },
@@ -225,7 +206,7 @@ function buildRerankRequest(
         body: {
           model,
           query,
-          documents: candidates,
+          documents,
           // Voyage uses top_k (not top_n) to limit reranked outputs.
           top_k: topN,
         },
@@ -241,7 +222,7 @@ function buildRerankRequest(
         body: {
           model,
           query,
-          documents: candidates,
+          documents,
           top_n: topN,
         },
       };
@@ -251,7 +232,7 @@ function buildRerankRequest(
 /** Parse provider-specific response into unified format */
 function parseRerankResponse(
   provider: RerankProvider,
-  data: unknown,
+  data: Record<string, unknown>,
 ): RerankItem[] | null {
   const parseItems = (
     items: unknown,
@@ -277,41 +258,31 @@ function parseRerankResponse(
     }
     return parsed.length > 0 ? parsed : null;
   };
-  const objectData =
-    data && typeof data === "object" && !Array.isArray(data)
-      ? (data as Record<string, unknown>)
-      : undefined;
 
   switch (provider) {
-    case "tei":
-      return (
-        parseItems(data, ["score", "relevance_score"]) ??
-        parseItems(objectData?.results, ["score", "relevance_score"]) ??
-        parseItems(objectData?.data, ["score", "relevance_score"])
-      );
     case "dashscope": {
       // DashScope: { output: { results: [{ index, relevance_score }] } }
-      const output = objectData?.output as Record<string, unknown> | undefined;
+      const output = data.output as Record<string, unknown> | undefined;
       if (output) {
         return parseItems(output.results, ["relevance_score", "score"]);
       }
       // Fallback: try top-level results in case API format changes
-      return parseItems(objectData?.results, ["relevance_score", "score"]);
+      return parseItems(data.results, ["relevance_score", "score"]);
     }
     case "pinecone": {
       // Pinecone: usually { data: [{ index, score, ... }] }
       // Also tolerate results[] with score/relevance_score for robustness.
       return (
-        parseItems(objectData?.data, ["score", "relevance_score"]) ??
-        parseItems(objectData?.results, ["score", "relevance_score"])
+        parseItems(data.data, ["score", "relevance_score"]) ??
+        parseItems(data.results, ["score", "relevance_score"])
       );
     }
     case "voyage": {
       // Voyage: usually { data: [{ index, relevance_score }] }
       // Also tolerate results[] for compatibility across gateways.
       return (
-        parseItems(objectData?.data, ["relevance_score", "score"]) ??
-        parseItems(objectData?.results, ["relevance_score", "score"])
+        parseItems(data.data, ["relevance_score", "score"]) ??
+        parseItems(data.results, ["relevance_score", "score"])
       );
     }
     case "siliconflow":
@@ -320,8 +291,8 @@ function parseRerankResponse(
       // Jina / SiliconFlow: usually { results: [{ index, relevance_score }] }
       // Also tolerate data[] for compatibility across gateways.
       return (
-        parseItems(objectData?.results, ["relevance_score", "score"]) ??
-        parseItems(objectData?.data, ["relevance_score", "score"])
+        parseItems(data.results, ["relevance_score", "score"]) ??
+        parseItems(data.data, ["relevance_score", "score"])
       );
     }
   }
@@ -354,16 +325,37 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export class MemoryRetriever {
   private accessTracker: AccessTracker | null = null;
   private tierManager: TierManager | null = null;
+  private tagQueryRegex: RegExp;
 
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
     private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
     private decayEngine: DecayEngine | null = null,
-  ) { }
+  ) {
+    this.tagQueryRegex = this.buildTagQueryRegex(config.tagPrefixes);
+  }
 
   setAccessTracker(tracker: AccessTracker): void {
     this.accessTracker = tracker;
+  }
+
+  private buildTagQueryRegex(prefixes: string[]): RegExp {
+    if (!prefixes || prefixes.length === 0) {
+      // Fallback: match nothing
+      return /(?!)/;
+    }
+    const escaped = prefixes.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const pattern = `\\b(?:${escaped.join("|")}):[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\b`;
+    return new RegExp(pattern, "gi");
+  }
+
+  private extractTagTokens(query: string): string[] {
+    const matches = query.match(this.tagQueryRegex) || [];
+    const uniq = Array.from(
+      new Set(matches.map((s) => s.trim()).filter(Boolean)),
+    );
+    return uniq.slice(0, 5);
   }
 
   private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
@@ -375,6 +367,28 @@ export class MemoryRetriever {
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+
+    // Tag-style queries (e.g. "proj:AIF") should behave like exact filters.
+    // Hybrid vector search tends to introduce semantic false positives for short tokens.
+    const tags = this.extractTagTokens(query);
+    if (tags.length > 0 && this.config.mode !== "vector" && this.store.hasFtsSupport) {
+      const bm25 = await this.bm25OnlyRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+        tags,
+      );
+      if (bm25.length > 0) {
+        // Record access for reinforcement (manual recall only)
+        if (this.accessTracker && source === "manual") {
+          this.accessTracker.recordAccess(bm25.map((r) => r.entry.id));
+        }
+        return bm25;
+      }
+      // If there are no literal matches, fall back to normal retrieval so
+      // users can still find related wording.
+    }
 
     let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
@@ -399,6 +413,64 @@ export class MemoryRetriever {
     }
 
     return results;
+  }
+
+  private applyPostProcessingPipeline(
+    results: RetrievalResult[],
+    limit: number,
+  ): RetrievalResult[] {
+    const temporal = this.applyRecencyBoost(results);
+    const importance = this.applyImportanceWeight(temporal);
+    const lengthNormalized = this.applyLengthNormalization(importance);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
+    const denoised = this.config.filterNoise
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
+      : hardFiltered;
+    const deduplicated = this.applyMMRDiversity(denoised);
+    return deduplicated.slice(0, limit);
+  }
+
+  private async bm25OnlyRetrieval(
+    query: string,
+    limit: number,
+    scopeFilter?: string[],
+    category?: string,
+    mustContain?: string[],
+  ): Promise<RetrievalResult[]> {
+    const results = await this.store.bm25Search(
+      query,
+      Math.max(limit * 4, 20),
+      scopeFilter,
+    );
+
+    const filteredByCategory = category
+      ? results.filter((r) => r.entry.category === category)
+      : results;
+
+    const required = mustContain || [];
+    const literalFiltered = required.length
+      ? filteredByCategory.filter((r) => {
+          const textLower = r.entry.text.toLowerCase();
+          return required.every((t) => textLower.includes(t.toLowerCase()));
+        })
+      : filteredByCategory;
+
+    const mapped = literalFiltered.map(
+      (result, index) =>
+        ({
+          ...result,
+          sources: {
+            vector: undefined,
+            bm25: { score: result.score, rank: index + 1 },
+            fused: { score: result.score },
+          },
+        }) as RetrievalResult,
+    );
+
+    return this.applyPostProcessingPipeline(mapped, limit);
   }
 
   private async vectorOnlyRetrieval(
@@ -687,7 +759,7 @@ export class MemoryRetriever {
         clearTimeout(timeout);
 
         if (response.ok) {
-          const data: unknown = await response.json();
+          const data = (await response.json()) as Record<string, unknown>;
 
           // Parse provider-specific response into unified format
           const parsed = parseRerankResponse(provider, data);
@@ -1053,6 +1125,10 @@ export class MemoryRetriever {
   // Update configuration
   updateConfig(newConfig: Partial<RetrievalConfig>): void {
     this.config = { ...this.config, ...newConfig };
+    // Rebuild tag regex if tagPrefixes changed
+    if (newConfig.tagPrefixes) {
+      this.tagQueryRegex = this.buildTagQueryRegex(this.config.tagPrefixes);
+    }
   }
 
   // Get current configuration
